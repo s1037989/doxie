@@ -1,0 +1,202 @@
+package Doxie;
+use Mojo::Base -base;
+
+use Mojo::File qw/path tempfile/;
+use Mojo::Loader 'data_section';
+use Mojo::Collection 'c';
+use Mojo::Template;
+use Mojo::UserAgent;
+
+use Date::Simple 'today';
+
+has doxie => sub { die };
+has store => sub { die };
+has concurrent => 1;
+has ua => sub { Mojo::UserAgent->new };
+
+has __next => sub { Mojo::Collection->new };
+
+sub new {
+  my $self = shift->SUPER::new(@_);
+  $self->_store->list({hidden => 1})->grep(sub{path($_)->basename =~ /^\.#/})->each(sub{unlink $_});
+  $self;
+}
+
+sub discover {
+  my $self = shift;
+  warn "Auto discovery not implemented";
+}
+
+sub status {
+  my $self = shift;
+  my $doxie = $self->doxie;
+  $self->ua->get("http://$doxie/hello.json")->result->json;
+}
+
+sub list {
+  my ($self, $type) = @_;
+  my $doxie = $self->doxie;
+  #if ( $type eq 'pdf' ) {
+  #  my $pdf = $self->ua->get("http://$doxie/:sda1/DOXIE/PDF:.xml:Document:Sub")->result;
+  #  $pdf->dom('Document FPATH')->map('text');
+  #} elsif ( $type eq 'jpeg' ) {
+  #  my $jpeg = $self->ua->get("http://$doxie/:sda1/DOXIE/JPEG:.xml:Picture:Sub")->result;
+  #  $jpeg->dom('Picture FPATH')->map('text');
+  #}
+  c(@{$self->ua->get("http://$doxie/scans.json")->result->json});
+}
+
+sub recent {
+  my ($self, $type) = @_;
+  my $doxie = $self->doxie;
+  c($self->ua->get("http://$doxie/scans/recent.json")->result->json);
+}
+
+sub get_scan {
+  my ($self, $file, $cb) = @_;
+  my $doxie = $self->doxie;
+  return undef if $self->_locked($file);
+  my $next = $self->_next($file);
+  warn "GET $file -> $next\n";
+  $self->_lock($file);
+  $self->ua->get("http://$doxie/scans/$file" => sub {
+    my ($ua, $tx) = @_;
+    warn "GOT $file, writing to $next\n";
+    $tx->result->content->asset->move_to($next);
+    # on error unlink $next
+    $self->_unlock($file);
+    &$cb if $cb && ref $cb eq 'CODE';
+  });
+}
+
+sub get_thumbnail {
+  my ($self, $file, $cb) = @_;
+  my $doxie = $self->doxie;
+  return undef if $self->_locked($file);
+  my $next = $self->_next($file);
+  warn "GET $file -> $next\n";
+  $self->_lock($file);
+  $self->ua->get("http://$doxie/thumbnails/$file" => sub {
+    my ($ua, $tx) = @_;
+    warn "GOT $file, writing to $next\n";
+    $tx->result->content->asset->move_to($next);
+    # on error unlink $next
+    $self->_unlock($file);
+    &$cb if $cb && ref $cb eq 'CODE';
+  });
+}
+
+sub _lockfile {
+  my ($self, $file) = @_;
+  my $lockfile = path($file);
+  $lockfile =~ s/\W/_/g;
+  $lockfile = $self->_store->child(".#$lockfile");
+  #warn "Lockfile: $lockfile";
+  return $lockfile;
+}
+sub _lock {
+  my ($self, $file) = @_;
+  #warn "Locking $file";
+  $self->_lockfile($file)->spurt('');
+}
+sub _locked {
+  my ($self, $file) = @_;
+  return 1 if $self->_store->list->grep(sub{path($_)->basename =~ /^\.#/})->size >= $self->concurrent;
+  return -e $self->_lockfile($file);
+}
+sub _unlock {
+  my ($self, $file) = @_;
+  #warn "Unlocking $file";
+  unlink $self->_lockfile($file);
+}
+
+sub _store {
+  my $self = shift;
+  my ($Y, $m, $d) = map { sprintf '%02d', $_ } today->as_ymd;
+  my $path = path($self->store)->child($Y, $m, $d);
+  $path->make_path;
+  return $path;
+}
+
+sub _next {
+  my ($self, $file) = @_;
+  my $type = 'SCAN'; # or THUMBNAIL (get from caller)
+  my $store = $self->_store;
+  my ($ext) = (path($file)->basename =~ /\.(\w+)$/);
+  my $next = $self->__next->grep(qr/^${type}_\d{4}\.$ext/)->sort->last || $store->list->map(sub{path($_)->basename})->grep(qr/^${type}_\d{4}\.$ext/)->sort(sub{$a cmp $b})->last || "${type}_0000.$ext";
+  $next =~ s/_(\d+)\./sprintf "_%04d.", $1+1/e;
+  push @{$self->__next}, $store->child($next)->basename;
+  return $store->child($next);
+}
+
+sub del {
+  my ($self, @files) = @_;
+  return unless @files;
+  my $doxie = $self->doxie;
+  @files = grep { ! $self->_locked($_) } @files;
+  #my $headers = {
+  #  'Upgrade-Insecure-Requests' => 1,
+  #  'Content-Type' => "multipart/form-data; boundary=----WebKitFormBoundaryO1F4Rol7EvpDTulI",
+  #  'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  #};
+  #my $mt = Mojo::Template->new;
+  #my $multipart = $mt->vars(1)->render(data_section('main', 'delete.txt.ep'), {file => $file});
+  #$multipart =~ s/\n/\r\n/g;
+  #$self->ua->post("http://$doxie/.xmlalbum.page_index=1.chipsipcmd" => $headers => $multipart);
+  if ( $#files == 0 ) {
+    warn sprintf "DELETE %s", $files[0];
+    $self->ua->delete("http://$doxie/scans/$files[0]")
+  } elsif ( $#files > 0 ) {
+    warn sprintf "DELETES %s", join ',', @files;
+    $self->ua->post("http://$doxie/scans/delete.json" => j([@files]));
+  }
+}
+
+sub pull {
+  my ($self, $file) = @_;
+  $file or return;
+  warn "Pulling $file\n";
+  $self->get_scan($file, sub { $self->del($file) });
+}
+
+package main;
+
+use Mojo::IOLoop;
+use Mojo::File 'path';
+use Data::Dumper;
+
+$|=1;
+
+# Need to scan for the IP
+
+my $doxie = Doxie->new(doxie => '192.168.0.127', store => '/home/stefan/Dropbox/Doxie');
+say Dumper $doxie->status;
+say Dumper $doxie->list;
+
+Mojo::IOLoop->recurring(5 => sub {
+  my $loop = shift;
+  warn "Checking for scans\n";
+  #$doxie->list('pdf')->each(sub{$doxie->download_and_delete($_)});
+  #$doxie->list('jpeg')->each(sub{$doxie->download_and_delete($_)});
+  $doxie->list->each(sub{$doxie->pull($_->{name})});
+});
+
+# Start event loop if necessary
+Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+
+__DATA__
+
+@@ delete.txt.ep
+------WebKitFormBoundaryO1F4Rol7EvpDTulI
+Content-Disposition: form-data; name="multiDelete"
+
+Delete Select File
+------WebKitFormBoundaryO1F4Rol7EvpDTulI
+Content-Disposition: form-data; name="currentPage"
+
+Current_page=[1]
+------WebKitFormBoundaryO1F4Rol7EvpDTulI
+Content-Disposition: form-data; name="<%= $file %>"
+
+on
+------WebKitFormBoundaryO1F4Rol7EvpDTulI--
