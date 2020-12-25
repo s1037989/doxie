@@ -10,20 +10,37 @@ has usage => sub { shift->extract_usage };
 sub run {
   my ($self, @args) = @_;
 
-  say $self->app->dumper($self->app->doxie->status) if $self->app->doxie->is_connected;
-
-  Mojo::IOLoop->timer(0 => sub { $self->pull });
   Mojo::IOLoop->recurring(5 => sub { $self->pull });
 
   # Start event loop if necessary
   Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
 }
 
+sub was_connected {
+  my $self = shift;
+  my $was_connected = $self->{was_connected} || 0;
+  $self->{was_connected} = $self->app->doxie->is_connected ? 1 : 0;
+  return $was_connected;
+}
+
 sub pull {
   my $self = shift;
-  $self->app->log->debug('Not connected') and return unless my $doxie = $self->app->doxie->is_connected;
-  $self->app->log->debug(sprintf "Checking for scans to pull from %s to local store %s", $doxie->doxie, $doxie->store);
-  $self->app->doxie->pull;
+  printf ".";
+  my $doxie = $self->status or $self->app->log->debug('Not connected') and return;
+  if ($doxie->is_busy) {
+    $self->app->log->debug(sprintf "Too busy to check for more scans to pull from %s to local store %s", $doxie->doxie, $doxie->store);
+  }
+  else {
+    $self->app->log->debug(sprintf "Checking for scans to pull from %s to local store %s", $doxie->doxie, $doxie->store);
+    $self->app->doxie->pull;
+  }
+}
+
+sub status {
+  my $self = shift;
+  my $doxie = $self->app->doxie->is_connected or return;
+  say $self->app->dumper($self->app->doxie->status) unless $self->was_connected;
+  return $doxie;
 }
 
 1;

@@ -33,6 +33,12 @@ sub is_connected {
   $self->ua->max_redirects(5)->get("http://$doxie")->res->error ? undef : $self;
 }
 
+sub is_busy {
+  my $self = shift;
+  return $self->active_downloads->size >= $self->max_concurrent;
+}
+
+
 sub discover {
   my $self = shift;
   die "Auto discovery not implemented, please specify the IP via the doxie parameter\n";
@@ -45,14 +51,14 @@ sub status {
 }
 
 sub list {
-  my $self = shift->is_connected or return;
+  my $self = shift->is_connected or return c();
   my $type = shift;
   my $doxie = $self->doxie;
   c(@{$self->ua->get("http://$doxie/scans.json")->result->json||[]});
 }
 
 sub recent {
-  my $self = shift->is_connected or return;
+  my $self = shift->is_connected or return c();
   my $type = shift;
   my $doxie = $self->doxie;
   c($self->ua->get("http://$doxie/scans/recent.json")->result->json);
@@ -62,18 +68,24 @@ sub get_scan {
   my $self = shift->is_connected or return;
   my ($file, $cb) = @_;
   my $doxie = $self->doxie;
-  return undef if $self->_max_concurrent || $self->_locked($file);
+  return undef if $self->is_busy || $self->_locked($file);
   $self->log->info("GET $file");
   $self->_lock($file);
-  $self->ua->get("http://$doxie/scans/$file" => sub {
+  my $tx = $self->ua->build_tx(GET => "http://$doxie/scans/$file");
+  $tx->res->content->on(read => sub {
+    my ($content, $bytes) = @_;
+    my $len = length($bytes);
+    $self->log->debug("$file ($len)");
+  });
+  $self->ua->start($tx => sub {
     my ($ua, $tx) = @_;
     if ( $tx->res->error ) {
-      $self->log->error(sprintf "Error retrieving $file: %s (did you scan a document which interrupts file transfers?)", $tx->res->error->{message});
+      $self->log->error(sprintf "Error retrieving $file: %s (did you scan a document which interrupts file transfers, or did it power off?)", $tx->res->error->{message});
       $self->_unlock($file);
     } else {
       my $next = $self->_next(scan => $file);
-      $self->log->debug("$file => $next");
       $tx->result->content->asset->move_to($next);
+      $self->log->info(sprintf '%s => %s (%d bytes)', $file, $next, $next->stat->size);
       $self->_unlock($file);
       &$cb if $cb && ref $cb eq 'CODE';
     }
@@ -84,18 +96,24 @@ sub get_thumbnail {
   my $self = shift->is_connected or return;
   my ($file, $cb) = @_;
   my $doxie = $self->doxie;
-  return undef if $self->_max_concurrent || $self->_locked($file);
+  return undef if $self->is_busy || $self->_locked($file);
   $self->log->info("GET $file");
   $self->_lock($file);
-  $self->ua->get("http://$doxie/thumbnails/$file" => sub {
+  my $tx = $self->ua->build_tx(GET => "http://$doxie/thumbnails/$file");
+  $tx->res->content->on(read => sub {
+    my ($content, $bytes) = @_;
+    my $len = length($bytes);
+    $self->log->debug("$file ($len)");
+  });
+  $self->ua->start($tx => sub {
     my ($ua, $tx) = @_;
     if ( $tx->res->error ) {
-      $self->log->error(sprintf "Error retrieving $file: %s (did you scan a document which interrupts file transfers?)", $tx->res->error->{message});
+      $self->log->error(sprintf "Error retrieving $file: %s (did you scan a document which interrupts file transfers, or did it power off?)", $tx->res->error->{message});
       $self->_unlock($file);
     } else {
       my $next = $self->_next(thumbnail => $file);
-      $self->log->debug("$file => $next");
       $tx->result->content->asset->move_to($next);
+      $self->log->info(sprintf '%s => %s (%d bytes)', $file, $next, $next->stat->size);
       $self->_unlock($file);
       &$cb if $cb && ref $cb eq 'CODE';
     }
@@ -123,7 +141,7 @@ sub pull {
   my $files = @_ ? c(@_) : $self->list->map(sub{$_->{name}});
   $files->each(sub {
     my $file = $_;
-    $self->get_scan($file, sub { $self->del($file) });
+    $self->get_scan($file, sub { $self->del($file) }) if path($file)->extname =~ /pdf|jpg/i;
   });
 }
 
@@ -137,7 +155,7 @@ sub cleanup {
   $self->_store->list({hidden=>1})->grep(qr/\.#/)->each(sub{unlink $_});
 }
 
-sub _store { path(shift->store) }
+sub _store { path(shift->store)->make_path }
 
 sub _ymdstore {
   my $self = shift;
@@ -155,11 +173,6 @@ sub _next {
   $next =~ s/_(\d+)\./sprintf "_%04d.", $1+1/e;
   $self->_ymdstore->child($next)->spurt('');
   return $self->_ymdstore->child($next);
-}
-
-sub _max_concurrent {
-  my $self = shift;
-  return $self->active_downloads->size >= $self->max_concurrent;
 }
 
 sub _lockfile {
